@@ -7,10 +7,8 @@
 
 #include "version.h" // Versión del firmware
 
-
 // Pines
 const int ledPin = LED_BUILTIN;  // En ESP8266 suele ser GPIO2
-const int configPin = 0;         // D3 (GPIO 0)
 
 // Red y MQTT
 WiFiClient espClient;
@@ -18,10 +16,8 @@ PubSubClient client(espClient);
 WiFiManager wm;
 
 // Configuración de MQTT
-// Broker: test.mosquitto.org se usa por defecto si no se configura otro
 char mqtt_server[40] = "test.mosquitto.org";
-// Topico por defecto: proyecto_sensores/sensor1/mensaje
-char mqtt_topic[64] = "proyecto_sensores/sensor1/mensaje";
+char mqtt_topic[64] = "proyecto_sensores/sensor/";
 
 WiFiManagerParameter custom_mqtt_server("server", "MQTT Broker", mqtt_server, 40);
 WiFiManagerParameter custom_mqtt_topic("topic", "MQTT Topic", mqtt_topic, 64);
@@ -29,149 +25,189 @@ WiFiManagerParameter custom_mqtt_topic("topic", "MQTT Topic", mqtt_topic, 64);
 bool shouldSaveConfig = false;
 unsigned long lastHeartbeat = 0;
 
+// Intervalo de sensado y publicación
+unsigned int publish_interval = 10; // en segundos, por defecto 10
+char mqtt_interval[6] = "10"; // WiFiManager requiere string
+
+WiFiManagerParameter custom_mqtt_interval("interval", "Intervalo (segundos)", mqtt_interval, 6);
+
+// ========================= FUNCIONES =========================
 void saveConfigCallback() {
   Serial.println("Se ha modificado la configuración, se guardará...");
   shouldSaveConfig = true;
 }
 
+// Cargar configuración guardada
 void loadConfig() {
   if (LittleFS.exists("/config.json")) {
     File configFile = LittleFS.open("/config.json", "r");
     if (configFile) {
       StaticJsonDocument<256> doc;
-      DeserializationError error = deserializeJson(doc, configFile);
-      if (!error) {
+      if (deserializeJson(doc, configFile) == DeserializationError::Ok) {
         strlcpy(mqtt_server, doc["mqtt_server"] | "test.mosquitto.org", sizeof(mqtt_server));
         strlcpy(mqtt_topic, doc["mqtt_topic"] | "proyecto_sensores/sensor1/mensaje", sizeof(mqtt_topic));
+
+        publish_interval = doc["interval"] | 10;
+        snprintf(mqtt_interval, sizeof(mqtt_interval), "%u", publish_interval);
+        
+        custom_mqtt_interval.setValue(mqtt_interval, sizeof(mqtt_interval));
+        custom_mqtt_server.setValue(mqtt_server, sizeof(mqtt_server));
+        custom_mqtt_topic.setValue(mqtt_topic, sizeof(mqtt_topic));
+        
+        
+        //publish_interval = atoi(mqtt_interval);
       }
+      
+      //serializeJsonPretty(doc, Serial);
       configFile.close();
     }
   }
+  
+  Serial.println("Server: " + String(mqtt_server)+"\n Topic: " + String(mqtt_topic) + "\n Intervalo: " + String(publish_interval) + "s");
+  delay(1000);
 }
 
+// Guardar configuración en el sistema de archivos
 void saveConfig() {
   StaticJsonDocument<256> doc;
   doc["mqtt_server"] = mqtt_server;
   doc["mqtt_topic"] = mqtt_topic;
+  doc["interval"] = publish_interval;
+
 
   File configFile = LittleFS.open("/config.json", "w");
   if (configFile) {
     serializeJson(doc, configFile);
+    Serial.println(serializeJsonPretty(doc, Serial));
     configFile.close();
     Serial.println("Configuración guardada en /config.json");
   } else {
     Serial.println("Error guardando configuración");
   }
+  Serial.println("Fin de la carga de configuración");
 }
 
-void blinkLED(int times, int delayMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(ledPin, LOW);  // Enciende (activo en bajo)
-    delay(delayMs);
-    digitalWrite(ledPin, HIGH); // Apaga
-    delay(delayMs);
+// Configuración de WiFi y MQTT
+void setupWiFi() {
+  wm.setSaveConfigCallback(saveConfigCallback);
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_topic);
+  wm.addParameter(&custom_mqtt_interval);
+
+  wm.setConfigPortalTimeout(30);  // Mostrar el portal durante 30 segundos
+  Serial.println("Entrando en modo configuración...");
+  digitalWrite(ledPin, LOW); // LED encendido
+
+  bool configResult = wm.startConfigPortal("Sensor-Config"); // Devuelve true si se conecta, false si expira
+  digitalWrite(ledPin, HIGH); // LED apagado
+
+  if (!configResult) {
+    Serial.println("Timeout del portal. Intentando conectar con los datos guardados...");
+    WiFi.begin(); // Usa las credenciales almacenadas por WiFiManager
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 20) {
+      delay(500);
+      Serial.print(".");
+      retries++;
+    }
+    Serial.println();
   }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi conectado tras el portal (o por timeout). IP:");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("No se pudo conectar a WiFi. Se reiniciará el dispositivo.");
+    delay(3000);
+    ESP.restart();
+  }
+
+  // Cargar parámetros personalizados
+  strlcpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server)); // Cargar el broker MQTT
+  strlcpy(mqtt_topic, custom_mqtt_topic.getValue(), sizeof(mqtt_topic)); // Cargar el topic MQTT
+  publish_interval = atoi(custom_mqtt_interval.getValue()); // Convertir string a entero
+  if (publish_interval == 0) publish_interval = 10; // Si el intervalo es 0, se establece en 10 segundos
+
+  if (shouldSaveConfig) saveConfig(); // Guardar configuración si se ha modificado
 }
 
-void reconnect() {
+// Configuración y definición de servidor MQTT
+void setupMQTT() {
+  client.setServer(mqtt_server, 1883);
+}
+
+// Conexión al broker MQTT
+void reconnectMQTT() {
+  unsigned int intentos = 0; //Intentos de conexión
   while (!client.connected()) {
     Serial.print("Conectando al broker MQTT...");
-    if (client.connect("ESP8266Client")) {
+    if (client.connect("ESP_RC_001")) {
       Serial.println("Conectado");
     } else {
       Serial.print("Fallo, rc=");
       Serial.print(client.state());
-      Serial.println(" intentando en 5s");
+      Serial.println(" - Intentando en 5s");
       delay(5000);
+      intentos++;
+      if (intentos > 5) {
+        Serial.println("No se pudo conectar al broker MQTT, reiniciando...");
+        ESP.restart(); // Reiniciar si no se conecta después de varios intentos
+      }
     }
   }
 }
 
+// Parpadeo del LED de estado
+void heartbeatLED() {
+  digitalWrite(ledPin, LOW);
+  delay(30);
+  digitalWrite(ledPin, HIGH);
+}
+
+// Publicar mensaje en el topic MQTT
+void publishMessage() {
+  String payload = "Hola desde un sensor conectado a ESP8266";
+  client.publish(mqtt_topic, payload.c_str());
+  Serial.println("Publicado: " + payload + " en el topic: " + mqtt_topic);
+}
+
+// ========================= SETUP Y LOOP =========================
+
+// Configuración inicial
 void setup() {
   pinMode(ledPin, OUTPUT);
-  digitalWrite(ledPin, HIGH); // Apagado
-  pinMode(configPin, INPUT_PULLUP);
-  delay(100);
+  digitalWrite(ledPin, HIGH); // LED apagado por defecto
 
   Serial.begin(115200);
-  delay(100);
+  Serial.println("\n\nIniciando...");
+  Serial.print("Firmware: " FIRMWARE_VERSION);
+  Serial.println(" | Build date: " __DATE__ " " __TIME__);
+  delay(3000);
 
   if (!LittleFS.begin()) {
     Serial.println("Fallo al montar LittleFS");
   }
 
-  // Establece forzar el inicio del portal mediante un botón físico
-  // Si el botón está presionado, forzamos la configuración
-  //bool forceConfig = digitalRead(configPin) == LOW;
-
-  bool forceConfig = true; // Forzar configuración para pruebas
-
-  loadConfig();
-
-  wm.setSaveConfigCallback(saveConfigCallback);
-  wm.addParameter(&custom_mqtt_server);
-  wm.addParameter(&custom_mqtt_topic);
-
-  // Agrega versión del firmware al footer HTML
-  String versionFooter = "<div style='text-align:center;font-size:smaller;margin-top:20px;color:#666;'>Firmware: ";
-  versionFooter += FIRMWARE_VERSION;
-  versionFooter += "</div>";
-  
-  wm.setCustomHeadElement(versionFooter.c_str());
-  
-  
-
-  if (forceConfig) {
-    Serial.println("Entrando en modo configuración...");
-    wm.setConfigPortalTimeout(30);
-    digitalWrite(ledPin, LOW); // LED encendido
-    wm.startConfigPortal("Sensor-Config");
-    digitalWrite(ledPin, HIGH); // LED apagado al salir
-  } else {
-    if (!wm.autoConnect("Sensor-Config")) {
-      Serial.println("Falló conexión WiFi, reiniciando...");
-      ESP.restart();
-    }
-  }
-
-  strlcpy(mqtt_server, custom_mqtt_server.getValue(), sizeof(mqtt_server));
-  strlcpy(mqtt_topic, custom_mqtt_topic.getValue(), sizeof(mqtt_topic));
-
-  if (shouldSaveConfig) {
-    saveConfig();
-  }
-
-  Serial.println("WiFi conectado");
-  Serial.print("IP local: ");
-  Serial.println(WiFi.localIP());
-
-  client.setServer(mqtt_server, 1883);
+  loadConfig(); // Cargar configuración guardada
+  setupWiFi(); // Configurar WiFi y MQTT topic
+  setupMQTT(); // Configurar MQTT
 }
 
+// Bucle principal
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
+  if (!client.connected()) reconnectMQTT();
   client.loop();
 
   static unsigned long lastPublish = 0;
   unsigned long now = millis();
 
-  // Publicación periódica
-  if (now - lastPublish > 5000) { // cada 5 segundos
-    String payload = "Hola desde ESP8266";
-    client.publish(mqtt_topic, payload.c_str());
-    Serial.println("Publicado: " + payload + " en el topic: " + mqtt_topic);
-
-    blinkLED(1, 100); // Feedback visual
+  if (now - lastPublish > publish_interval * 1000UL) {
+    publishMessage();
     lastPublish = now;
   }
 
-  // Pulso de vida cada 2s
   if (now - lastHeartbeat > 2000) {
-    digitalWrite(ledPin, LOW);
-    delay(30);
-    digitalWrite(ledPin, HIGH);
+    heartbeatLED();
     lastHeartbeat = now;
   }
 }
