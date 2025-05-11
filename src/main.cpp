@@ -43,6 +43,7 @@ void loadConfig() {
     File configFile = LittleFS.open("/config.json", "r");
     if (configFile) {
       StaticJsonDocument<256> doc;
+      // Si no encuentra el archivo, se crea uno nuevo con valores por defecto
       if (deserializeJson(doc, configFile) == DeserializationError::Ok) {
         strlcpy(mqtt_server, doc["mqtt_server"] | "test.mosquitto.org", sizeof(mqtt_server));
         strlcpy(mqtt_topic, doc["mqtt_topic"] | "proyecto_sensores/sensor1/mensaje", sizeof(mqtt_topic));
@@ -144,6 +145,7 @@ void reconnectMQTT() {
     if (client.connect("ESP_RC_001")) {
       Serial.println("Conectado");
     } else {
+      // Falla al conectar, espera 5 segundos y vuelve a intentar
       Serial.print("Fallo, rc=");
       Serial.print(client.state());
       Serial.println(" - Intentando en 5s");
@@ -166,10 +168,55 @@ void heartbeatLED() {
 
 // Publicar mensaje en el topic MQTT
 void publishMessage() {
-  String payload = "Hola desde un sensor conectado a ESP8266";
-  client.publish(mqtt_topic, payload.c_str());
+  String payload = "alive";
+
+  // Armar los topics específicos
+  String topicStatus = String(mqtt_topic) + "/status";
+
+  client.publish(topicStatus.c_str(), payload.c_str());
   Serial.println("Publicado: " + payload + " en el topic: " + mqtt_topic);
 }
+
+// Sensores simulados (no implementados en este código)
+float simulateTemperature() {
+  return random(200, 350) / 10.0; // Temperaturas entre 20.0 y 35.0 °C
+}
+
+float simulateHumidity() {
+  return random(300, 800) / 10.0; // Humedad entre 30.0% y 80.0%
+}
+
+// publica los datos de los sensores simulados en el topic MQTT
+void publishSensorData() {
+  float temp = simulateTemperature();
+  float hum = simulateHumidity();
+
+  // Armar los topics específicos
+  String topicTemp = String(mqtt_topic) + "temp";
+  String topicHum = String(mqtt_topic) + "hum";
+
+  // Convertir a cadenas para enviar por MQTT
+  char payloadTemp[16];
+  dtostrf(temp, 4, 1, payloadTemp);  // float a string con 1 decimal
+
+  char payloadHum[16];
+  dtostrf(hum, 4, 1, payloadHum);
+
+  // Publicar
+  boolean ok1 = client.publish(topicTemp.c_str(), payloadTemp);
+  boolean ok2 = client.publish(topicHum.c_str(), payloadHum);
+
+  if (ok1 && ok2) {
+    Serial.println("Publicado:");
+    Serial.println(topicTemp + ": " + payloadTemp);
+    Serial.println(topicHum + ": " + payloadHum);
+  } else {
+    Serial.println("Error al publicar temperatura o humedad");
+  }
+}
+
+
+
 
 // ========================= SETUP Y LOOP =========================
 
@@ -202,12 +249,13 @@ void loop() {
   unsigned long now = millis();
 
   if (now - lastPublish > publish_interval * 1000UL) {
-    publishMessage();
+    publishSensorData(); // Publicar datos de sensores simulados
     lastPublish = now;
   }
 
   if (now - lastHeartbeat > 2000) {
     heartbeatLED();
     lastHeartbeat = now;
+    publishMessage();
   }
 }
