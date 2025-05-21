@@ -7,13 +7,30 @@
 
 #include "version.h" // Versión del firmware
 
+// Librerías de sensores
+#include <DHT.h>
+#define DHTTYPE    DHT11
+#define DHTPIN     5 // Pin GPIO donde está conectado el sensor DHT11
+DHT dht(DHTPIN, DHTTYPE); // Inicializa el sensor DHT11
+
+
 // Pines
 const int ledPin = LED_BUILTIN;  // En ESP8266 suele ser GPIO2
+
+
 
 // Red y MQTT
 WiFiClient espClient;
 PubSubClient client(espClient);
 WiFiManager wm;
+
+
+// Variables de sensores
+float temp = 0.0;
+float hum = 0.0;
+
+bool sensorSimulado = false;
+
 
 // Configuración de MQTT
 char mqtt_server[40] = "test.mosquitto.org";
@@ -177,6 +194,21 @@ void publishMessage() {
   Serial.println("Publicado: " + payload + " en el topic: " + mqtt_topic);
 }
 
+// Leer el sensor DHT11
+// Devuelve true si la lectura es correcta, false si hay error
+bool leerSensor(float &t, float &h) {
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+
+  if (isnan(temp) || isnan(hum)) {
+    return false;
+  } else {
+    t = temp;
+    h = hum;
+    return true;
+  }
+}
+
 // Sensores simulados (no implementados en este código)
 float simulateTemperature() {
   return random(200, 350) / 10.0; // Temperaturas entre 20.0 y 35.0 °C
@@ -188,21 +220,31 @@ float simulateHumidity() {
 
 // publica los datos de los sensores simulados en el topic MQTT
 void publishSensorData() {
-  float temp = simulateTemperature();
-  float hum = simulateHumidity();
+  float tempLeida = dht.readTemperature();
+  float humLeida = dht.readHumidity();
 
-  // Armar los topics específicos
+  if (isnan(tempLeida) || isnan(humLeida)) {
+    // Lectura fallida: usar simulación
+    sensorSimulado = true;
+    temp = simulateTemperature();
+    hum = simulateHumidity();
+    Serial.println("⚠️ Lectura fallida del sensor. Usando valores simulados.");
+  } else {
+    sensorSimulado = false;
+    temp = tempLeida;
+    hum = humLeida;
+    Serial.println("✅ Lectura de sensor exitosa.");
+  }
+
+  // Publicar temperatura y humedad
   String topicTemp = String(mqtt_topic) + "temp";
   String topicHum = String(mqtt_topic) + "hum";
 
-  // Convertir a cadenas para enviar por MQTT
   char payloadTemp[16];
-  dtostrf(temp, 4, 1, payloadTemp);  // float a string con 1 decimal
-
   char payloadHum[16];
+  dtostrf(temp, 4, 1, payloadTemp);
   dtostrf(hum, 4, 1, payloadHum);
 
-  // Publicar
   boolean ok1 = client.publish(topicTemp.c_str(), payloadTemp);
   boolean ok2 = client.publish(topicHum.c_str(), payloadHum);
 
@@ -211,9 +253,22 @@ void publishSensorData() {
     Serial.println(topicTemp + ": " + payloadTemp);
     Serial.println(topicHum + ": " + payloadHum);
   } else {
-    Serial.println("Error al publicar temperatura o humedad");
+    Serial.println("❌ Error al publicar temperatura o humedad");
   }
+
+  // Publicar si son simulados
+  String topicSim = String(mqtt_topic) + "simulated";
+  const char* simState = sensorSimulado ? "true" : "false";
+  client.publish(topicSim.c_str(), simState);
+  Serial.println("Publicado flag de simulación: " + String(simState));
 }
+
+
+
+
+
+
+
 
 
 
@@ -238,6 +293,9 @@ void setup() {
   loadConfig(); // Cargar configuración guardada
   setupWiFi(); // Configurar WiFi y MQTT topic
   setupMQTT(); // Configurar MQTT
+
+  dht.begin(); // Inicializar el sensor DHT11
+
 }
 
 // Bucle principal
